@@ -1,6 +1,4 @@
 """
-NetSQLite using multiprocessing.connection instead of XML-RPC.
-
 An easy way to share an SQLite databases across multiple processes/threads *on same machine*,
 with less risk of weird locking issues than if going via shared file system.
 
@@ -8,8 +6,8 @@ Single file and only standard-library dependencies.
 
 Compatible with Python 3.6 and newer.
 
-About 300x overhead compared to normal sqlite3 (vs 1000x for XML-RPC version),
-allowing ~2000-3000 queries/second!
+About 300x overhead compared to normal sqlite3, allowing 3000+ queries/second!
+Uses multiprocessing.connection for ~6x better performance than XML-RPC version.
 """
 
 import logging
@@ -33,23 +31,19 @@ ExecuteParamType = Optional[Sequence[Union[str, int]]]
 
 
 class MPConnection:
-    """Client connection using multiprocessing.connection."""
-
     def __init__(self, conn, database_name: str, port: int):
         self.database_name = database_name
         self.conn = conn
         self.port = port
         self.child_process: Optional[subprocess.Popen] = None
-        self._lock = threading.Lock()  # Thread-safe access to connection
+        self._lock = threading.Lock()
 
     def _send_receive(self, message):
-        """Send message and receive response with thread safety."""
         with self._lock:
             try:
                 self.conn.send(message)
                 response = self.conn.recv()
 
-                # Check if server returned an exception
                 if isinstance(response, Exception):
                     raise response
 
@@ -70,7 +64,6 @@ class MPConnection:
         return self._send_receive(('execute', query, params))
 
     def target_database(self):
-        """Get the database path from server."""
         return self._send_receive(('target_database',))
 
     def are_we_gainfully_connected(self):
@@ -81,7 +74,6 @@ class MPConnection:
             return False
 
     def close(self):
-        """Close the connection."""
         try:
             self.conn.close()
         except:
@@ -96,8 +88,6 @@ class MPConnection:
 
 
 class MPServer:
-    """Server using multiprocessing.connection."""
-
     def __init__(self, db_path: str, port: int):
         self.db_path = db_path
         self.port = port
@@ -118,14 +108,11 @@ class MPServer:
 
         with self.lock:
             res = self.connection.execute(query, params).fetchall()
-        # Convert tuples to lists to match XML-RPC behavior
         return [list(row) for row in res]
 
     def handle_client(self, conn):
-        """Handle a single client connection."""
         try:
             while True:
-                # Receive message
                 message = conn.recv()
 
                 if not isinstance(message, tuple) or len(message) == 0:
@@ -135,7 +122,6 @@ class MPServer:
                 method_name = message[0]
 
                 try:
-                    # Dispatch to appropriate method
                     if method_name == 'execute':
                         if len(message) < 3:
                             result = Exception("execute requires query and params")
@@ -160,20 +146,17 @@ class MPServer:
                     conn.send(e)
 
         except (EOFError, ConnectionResetError, BrokenPipeError):
-            # Client disconnected
             pass
         finally:
             conn.close()
 
     def serve_forever(self):
-        """Accept connections and handle them in separate threads."""
         log.info(f"MPServer listening on port {self.port}")
         try:
             while self.running:
                 conn = self.listener.accept()
                 log.debug(f"Client connected from {conn}")
 
-                # Handle each client in a separate thread
                 client_thread = threading.Thread(
                     target=self.handle_client,
                     args=(conn,),
@@ -204,14 +187,12 @@ def __spawn_server_process__(db_name: str, port: int) -> subprocess.Popen:
 
 
 def __poll(port: int, db_name: str, timeout: float = 10.0):
-    """Poll until server is ready and return connection."""
     wait = 0.1
     total_waited = 0
 
     while total_waited < timeout:
         try:
             conn = Client(('localhost', port))
-            # Verify it's the right database
             conn.send(('target_database',))
             response = conn.recv()
 
@@ -231,15 +212,11 @@ def __poll(port: int, db_name: str, timeout: float = 10.0):
 
 
 def connect(db_name: str):
-    """Connect to a NetSQLite-MP server, spawning one if necessary."""
     for port_offset in range(10):
         port = STARTPORT + port_offset
 
         try:
-            # Try to connect to existing server
             conn = Client(('localhost', port))
-
-            # Check if it's serving the right database
             conn.send(('target_database',))
             response = conn.recv()
 
@@ -249,7 +226,6 @@ def connect(db_name: str):
                             "but serving another database.")
                 continue
 
-            # Test connection
             conn.send(('ping',))
             conn.recv()
 
@@ -257,7 +233,6 @@ def connect(db_name: str):
             return MPConnection(conn, db_name, port)
 
         except (ConnectionRefusedError, OSError):
-            # No server running, spawn one
             log.info(f"No server on port {port}, spawning one")
             proc = __spawn_server_process__(db_name=db_name, port=port)
             conn = __poll(port, db_name)
