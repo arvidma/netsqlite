@@ -1,0 +1,284 @@
+"""
+NetSQLite using multiprocessing.connection instead of XML-RPC.
+
+An easy way to share an SQLite databases across multiple processes/threads *on same machine*,
+with less risk of weird locking issues than if going via shared file system.
+
+Single file and only standard-library dependencies.
+
+Compatible with Python 3.6 and newer.
+
+About 300x overhead compared to normal sqlite3 (vs 1000x for XML-RPC version),
+allowing ~2000-3000 queries/second!
+"""
+
+import logging
+import os
+import sqlite3
+import subprocess
+import sys
+import threading
+from multiprocessing.connection import Client, Listener
+from time import sleep
+from typing import Any, Optional, Sequence, Union
+
+log = logging.getLogger(__name__)
+
+DUMMY_QUERY = "SELECT name FROM sqlite_master WHERE type='table' LIMIT 1;"
+STARTPORT = 25442  # Different from XML-RPC version to avoid conflicts
+SPAWN_COMMAND = "spawn"
+
+ExecuteReturnType = Optional[Sequence[Sequence[Any]]]  # TypeAlias is only supported from 3.10
+ExecuteParamType = Optional[Sequence[Union[str, int]]]
+
+
+class MPConnection:
+    """Client connection using multiprocessing.connection."""
+
+    def __init__(self, conn, database_name: str, port: int):
+        self.database_name = database_name
+        self.conn = conn
+        self.port = port
+        self.child_process: Optional[subprocess.Popen] = None
+        self._lock = threading.Lock()  # Thread-safe access to connection
+
+    def _send_receive(self, message):
+        """Send message and receive response with thread safety."""
+        with self._lock:
+            try:
+                self.conn.send(message)
+                response = self.conn.recv()
+
+                # Check if server returned an exception
+                if isinstance(response, Exception):
+                    raise response
+
+                return response
+            except (EOFError, ConnectionResetError, BrokenPipeError) as e:
+                raise ConnectionError(f"Connection to server lost: {e}")
+
+    def execute(self, query: str, params: ExecuteParamType = None, check=True) -> ExecuteReturnType:
+        if check and not self.are_we_gainfully_connected():
+            # oops, server is dead. try once to restart it.
+            new_conn = connect(self.database_name)
+            self.conn = new_conn.conn
+            self.child_process = new_conn.child_process
+
+        if not params:
+            params = tuple()
+
+        return self._send_receive(('execute', query, params))
+
+    def target_database(self):
+        """Get the database path from server."""
+        return self._send_receive(('target_database',))
+
+    def are_we_gainfully_connected(self):
+        try:
+            self._send_receive(('ping',))
+            return True
+        except (ConnectionError, EOFError, OSError):
+            return False
+
+    def close(self):
+        """Close the connection."""
+        try:
+            self.conn.close()
+        except:
+            pass
+
+    def __del__(self):
+        # If we started the server, our process will hang until the server is killed. If someone
+        # else is using it, they can start up their own server.
+        if self.child_process:
+            self.child_process.kill()
+        self.close()
+
+
+class MPServer:
+    """Server using multiprocessing.connection."""
+
+    def __init__(self, db_path: str, port: int):
+        self.db_path = db_path
+        self.port = port
+        self.lock = threading.Lock()
+        self.connection = sqlite3.connect(db_path, check_same_thread=False)
+        self.listener = Listener(('localhost', port))
+        self.running = True
+
+    def target_database(self):
+        return self.db_path
+
+    def execute(
+            self, query: str, params: Optional[Sequence[Any]] = None
+    ) -> Optional[Sequence[Sequence[Any]]]:
+        log.debug(f"Query: {query} with parameters: {params}")
+        if not params:
+            params = tuple()
+
+        with self.lock:
+            res = self.connection.execute(query, params).fetchall()
+        # Convert tuples to lists to match XML-RPC behavior
+        return [list(row) for row in res]
+
+    def handle_client(self, conn):
+        """Handle a single client connection."""
+        try:
+            while True:
+                # Receive message
+                message = conn.recv()
+
+                if not isinstance(message, tuple) or len(message) == 0:
+                    conn.send(Exception("Invalid message format"))
+                    continue
+
+                method_name = message[0]
+
+                try:
+                    # Dispatch to appropriate method
+                    if method_name == 'execute':
+                        if len(message) < 3:
+                            result = Exception("execute requires query and params")
+                        else:
+                            query = message[1]
+                            params = message[2]
+                            result = self.execute(query, params)
+
+                    elif method_name == 'target_database':
+                        result = self.target_database()
+
+                    elif method_name == 'ping':
+                        result = 'pong'
+
+                    else:
+                        result = Exception(f"Unknown method: {method_name}")
+
+                    conn.send(result)
+
+                except Exception as e:
+                    log.error(f"Error handling {method_name}: {e}")
+                    conn.send(e)
+
+        except (EOFError, ConnectionResetError, BrokenPipeError):
+            # Client disconnected
+            pass
+        finally:
+            conn.close()
+
+    def serve_forever(self):
+        """Accept connections and handle them in separate threads."""
+        log.info(f"MPServer listening on port {self.port}")
+        try:
+            while self.running:
+                conn = self.listener.accept()
+                log.debug(f"Client connected from {conn}")
+
+                # Handle each client in a separate thread
+                client_thread = threading.Thread(
+                    target=self.handle_client,
+                    args=(conn,),
+                    daemon=True
+                )
+                client_thread.start()
+
+        except KeyboardInterrupt:
+            log.info("Server shutting down")
+        finally:
+            self.listener.close()
+
+
+def __server_startup__(port: int, database_name: str):
+    log.info("Hello! The NetSQLite-MP server-component is being launched.")
+    log.info(f"Connected to sqlite database: '{database_name}'")
+
+    server = MPServer(database_name, port)
+    log.info(f"Listener instantiated on port {port}")
+    log.info("Calling .serve_forever()")
+    server.serve_forever()
+
+
+def __spawn_server_process__(db_name: str, port: int) -> subprocess.Popen:
+    proc = subprocess.Popen(["python", __file__, SPAWN_COMMAND, db_name, str(port)])
+    log.info(f"An sqlite server was spawned with PID {proc.pid}")
+    return proc
+
+
+def __poll(port: int, db_name: str, timeout: float = 10.0):
+    """Poll until server is ready and return connection."""
+    wait = 0.1
+    total_waited = 0
+
+    while total_waited < timeout:
+        try:
+            conn = Client(('localhost', port))
+            # Verify it's the right database
+            conn.send(('target_database',))
+            response = conn.recv()
+
+            if response == db_name:
+                return conn
+
+            conn.close()
+            raise RuntimeError(f"Server on port {port} serves different database: {response}")
+
+        except (ConnectionRefusedError, OSError):
+            log.info(f"Sleeping {wait} seconds to let server start up.")
+            sleep(wait)
+            total_waited += wait
+            wait = min(wait * 1.5, 1.0)
+
+    raise RuntimeError(f"Giving up waiting for spawned server after {total_waited}+ seconds.")
+
+
+def connect(db_name: str):
+    """Connect to a NetSQLite-MP server, spawning one if necessary."""
+    for port_offset in range(10):
+        port = STARTPORT + port_offset
+
+        try:
+            # Try to connect to existing server
+            conn = Client(('localhost', port))
+
+            # Check if it's serving the right database
+            conn.send(('target_database',))
+            response = conn.recv()
+
+            if response != db_name:
+                conn.close()
+                log.warning(f"A server is already running on port {port}, "
+                            "but serving another database.")
+                continue
+
+            # Test connection
+            conn.send(('ping',))
+            conn.recv()
+
+            log.info(f"Connected to existing server on port {port}")
+            return MPConnection(conn, db_name, port)
+
+        except (ConnectionRefusedError, OSError):
+            # No server running, spawn one
+            log.info(f"No server on port {port}, spawning one")
+            proc = __spawn_server_process__(db_name=db_name, port=port)
+            conn = __poll(port, db_name)
+
+            mp_conn = MPConnection(conn, db_name, port)
+            mp_conn.child_process = proc
+            return mp_conn
+
+    raise RuntimeError(f"Could not create connection to '{db_name}'")
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format=f"[%(asctime)s] %(levelname)s [{os.getpid()}:%(name)s]: %(message)s"
+    )
+
+    if len(sys.argv) == 4 and sys.argv[1] == SPAWN_COMMAND:
+        __server_startup__(port=int(sys.argv[3]), database_name=sys.argv[2])
+
+    else:
+        filnamn = os.path.basename(__file__)
+        print(f"SYNTAX ERROR: {filnamn} {' '.join(sys.argv)}")
+        print(f"Usage: {filnamn} {SPAWN_COMMAND} <database_file_path> <port-number>")
