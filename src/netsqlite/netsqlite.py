@@ -6,8 +6,7 @@ Single file and only standard-library dependencies.
 
 Compatible with Python 3.6 and newer.
 
-About 1000x overhead compared to normal sqlite3, but that still allows 10k queries/second
-on the development machine!
+About 300x overhead compared to normal sqlite3, allowing 3000+ queries/second!
 """
 
 import logging
@@ -16,10 +15,9 @@ import sqlite3
 import subprocess
 import sys
 import threading
-import xmlrpc.client
+from multiprocessing.connection import Client, Listener
 from time import sleep
 from typing import Any, Optional, Sequence, Union
-from xmlrpc.server import SimpleXMLRPCServer
 
 log = logging.getLogger(__name__)
 
@@ -27,47 +25,66 @@ DUMMY_QUERY = "SELECT name FROM sqlite_master WHERE type='table' LIMIT 1;"
 STARTPORT = 25432
 SPAWN_COMMAND = "spawn"
 
-ExecuteReturnType = Optional[Sequence[Sequence[Any]]]  # TypeAlias is only supported from 3.10
+ExecuteReturnType = Optional[Sequence[Sequence[Any]]]
 ExecuteParamType = Optional[Sequence[Union[str, int]]]
 
 
 class NetSQLiteConnection:
-    def __init__(self, port: int, database_name: str):
+    def __init__(self, conn, database_name: str, port: int):
         self.database_name = database_name
-        self.proxy = xmlrpc.client.ServerProxy(f"http://localhost:{port}/")
+        self.conn = conn
+        self.port = port
         self.child_process: Optional[subprocess.Popen] = None
+        self._lock = threading.Lock()
+
+    def _send_receive(self, message):
+        with self._lock:
+            try:
+                self.conn.send(message)
+                response = self.conn.recv()
+
+                if isinstance(response, Exception):
+                    raise response
+
+                return response
+            except (EOFError, ConnectionResetError, BrokenPipeError) as e:
+                raise ConnectionError(f"Connection to server lost: {e}")
 
     def execute(self, query: str, params: ExecuteParamType = None, check=True) -> ExecuteReturnType:
         if check and not self.are_we_gainfully_connected():
-            # oops, server is dead. try once to restart it.
-            new_nsql = connect(self.database_name)
-            self.proxy = new_nsql.proxy
+            new_conn = connect(self.database_name)
+            self.conn = new_conn.conn
+            self.child_process = new_conn.child_process
 
         if not params:
             params = tuple()
 
-        return self.proxy.execute(query, params)
+        return self._send_receive(('execute', query, params))
 
     def are_we_gainfully_connected(self):
         try:
-            self.execute(DUMMY_QUERY, check=False)
-        except ConnectionError:
+            self._send_receive(('ping',))
+            return True
+        except (ConnectionError, EOFError, OSError):
             return False
 
-        return True
-
     def __del__(self):
-        # If we started the server, our process will hang until the server is killed. If someone
-        # else is using it, they can start up their own server.
         if self.child_process:
             self.child_process.kill()
+        try:
+            self.conn.close()
+        except:
+            pass
 
 
 class NetSQLiteServer:
-    def __init__(self, db_path):
+    def __init__(self, db_path: str, port: int):
         self.db_path = db_path
+        self.port = port
         self.lock = threading.Lock()
-        self.connection = sqlite3.connect(self.db_path)
+        self.connection = sqlite3.connect(db_path, check_same_thread=False)
+        self.listener = Listener(('localhost', port))
+        self.running = True
 
     def target_database(self):
         return self.db_path
@@ -81,19 +98,74 @@ class NetSQLiteServer:
 
         with self.lock:
             res = self.connection.execute(query, params).fetchall()
-        return res
+        return [list(row) for row in res]
+
+    def handle_client(self, conn):
+        try:
+            while True:
+                message = conn.recv()
+
+                if not isinstance(message, tuple) or len(message) == 0:
+                    conn.send(Exception("Invalid message format"))
+                    continue
+
+                method_name = message[0]
+
+                try:
+                    if method_name == 'execute':
+                        if len(message) < 3:
+                            result = Exception("execute requires query and params")
+                        else:
+                            result = self.execute(message[1], message[2])
+
+                    elif method_name == 'target_database':
+                        result = self.target_database()
+
+                    elif method_name == 'ping':
+                        result = 'pong'
+
+                    else:
+                        result = Exception(f"Unknown method: {method_name}")
+
+                    conn.send(result)
+
+                except Exception as e:
+                    log.error(f"Error handling {method_name}: {e}")
+                    conn.send(e)
+
+        except (EOFError, ConnectionResetError, BrokenPipeError):
+            pass
+        finally:
+            conn.close()
+
+    def serve_forever(self):
+        log.info(f"NetSQLite server listening on port {self.port}")
+        try:
+            while self.running:
+                conn = self.listener.accept()
+                log.debug(f"Client connected")
+
+                client_thread = threading.Thread(
+                    target=self.handle_client,
+                    args=(conn,),
+                    daemon=True
+                )
+                client_thread.start()
+
+        except KeyboardInterrupt:
+            log.info("Server shutting down")
+        finally:
+            self.listener.close()
 
 
-def __server_startup__(port, database_name):
+def __server_startup__(port: int, database_name: str):
     log.info("Hello! The NetSQLite server-component is being launched.")
-    nsql = NetSQLiteServer(database_name)
     log.info(f"Connected to sqlite database: '{database_name}'")
-    with SimpleXMLRPCServer(("localhost", port), logRequests=False) as server:
-        log.info(f"XMLRPCServer object is instantiated using port {port}")
-        server.register_introspection_functions()
-        server.register_instance(nsql)
-        log.info("Calling .serve_forever()")
-        server.serve_forever()
+
+    server = NetSQLiteServer(database_name, port)
+    log.info(f"Listener instantiated on port {port}")
+    log.info("Calling .serve_forever()")
+    server.serve_forever()
 
 
 def __spawn_server_process__(db_name: str, port: int) -> subprocess.Popen:
@@ -102,42 +174,62 @@ def __spawn_server_process__(db_name: str, port: int) -> subprocess.Popen:
     return proc
 
 
-def __poll(nsql: NetSQLiteConnection):
+def __poll(port: int, db_name: str, timeout: float = 10.0):
     wait = 0.1
-    while wait < 10:
-        if nsql.are_we_gainfully_connected():
-            return
+    total_waited = 0
 
-        log.info(f"Sleeping {wait} seconds to let server start up.")
-        sleep(wait)
-        wait = wait * 1.5
+    while total_waited < timeout:
+        try:
+            conn = Client(('localhost', port))
+            conn.send(('target_database',))
+            response = conn.recv()
 
-    raise RuntimeError(f"Giving up waiting for spawned server after {wait}+ seconds.")
+            if response == db_name:
+                return conn
+
+            conn.close()
+            raise RuntimeError(f"Server on port {port} serves different database: {response}")
+
+        except (ConnectionRefusedError, OSError):
+            log.info(f"Sleeping {wait} seconds to let server start up.")
+            sleep(wait)
+            total_waited += wait
+            wait = min(wait * 1.5, 1.0)
+
+    raise RuntimeError(f"Giving up waiting for spawned server after {total_waited}+ seconds.")
 
 
 def connect(db_name: str):
-    nsql = None
-
     for port_offset in range(10):
         port = STARTPORT + port_offset
-        nsql = NetSQLiteConnection(port, db_name)
+
         try:
-            if not nsql.proxy.target_database() == db_name:
+            conn = Client(('localhost', port))
+            conn.send(('target_database',))
+            response = conn.recv()
+
+            if response != db_name:
+                conn.close()
                 log.warning(f"A server is already running on port {port}, "
                             "but serving another database.")
                 continue
-            elif nsql.are_we_gainfully_connected():
-                break
-        except ConnectionError:
+
+            conn.send(('ping',))
+            conn.recv()
+
+            log.info(f"Connected to existing server on port {port}")
+            return NetSQLiteConnection(conn, db_name, port)
+
+        except (ConnectionRefusedError, OSError):
+            log.info(f"No server on port {port}, spawning one")
             proc = __spawn_server_process__(db_name=db_name, port=port)
-            nsql.child_process = proc
-            __poll(nsql)
-            break
+            conn = __poll(port, db_name)
 
-    if not nsql:
-        raise RuntimeError(f"Could not create connection to '{db_name}'")
+            nsql_conn = NetSQLiteConnection(conn, db_name, port)
+            nsql_conn.child_process = proc
+            return nsql_conn
 
-    return nsql
+    raise RuntimeError(f"Could not create connection to '{db_name}'")
 
 
 if __name__ == "__main__":
@@ -147,7 +239,7 @@ if __name__ == "__main__":
     )
 
     if len(sys.argv) == 4 and sys.argv[1] == SPAWN_COMMAND:
-        __server_startup__(database_name=sys.argv[2], port=int(sys.argv[3]))
+        __server_startup__(port=int(sys.argv[3]), database_name=sys.argv[2])
 
     else:
         filnamn = os.path.basename(__file__)
