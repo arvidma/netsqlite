@@ -82,7 +82,7 @@ class NetSQLiteServer:
         self.db_path = db_path
         self.port = port
         self.lock = threading.Lock()
-        self.connection = sqlite3.connect(db_path, check_same_thread=False)
+        self.connection = sqlite3.connect(db_path, check_same_thread=False, isolation_level=None)
         self.listener = Listener(('localhost', port))
         self.running = True
 

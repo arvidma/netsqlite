@@ -1,4 +1,5 @@
 # netsqlite
+SQLite, almost transparently shared across processes
 
 An easy way to share an SQLite databases across multiple processes/threads *on same machine*,
 with less risk of weird locking issues than if going via shared file system.
