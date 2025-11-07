@@ -9,6 +9,7 @@ Compatible with Python 3.6 and newer.
 About 300x overhead compared to normal sqlite3, allowing 3000+ queries/second!
 """
 
+import hmac
 import logging
 import os
 import sqlite3
@@ -30,10 +31,11 @@ ExecuteParamType = Optional[Sequence[Union[str, int]]]
 
 
 class NetSQLiteConnection:
-    def __init__(self, conn, database_name: str, port: int):
+    def __init__(self, conn, database_name: str, port: int, auth_token: Optional[str] = None):
         self.database_name = database_name
         self.conn = conn
         self.port = port
+        self.auth_token = auth_token
         self.child_process: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
 
@@ -52,7 +54,7 @@ class NetSQLiteConnection:
 
     def execute(self, query: str, params: ExecuteParamType = None, check=True) -> ExecuteReturnType:
         if check and not self.are_we_gainfully_connected():
-            new_conn = connect(self.database_name)
+            new_conn = connect(self.database_name, auth_token=self.auth_token)
             self.conn = new_conn.conn
             self.child_process = new_conn.child_process
 
@@ -78,9 +80,10 @@ class NetSQLiteConnection:
 
 
 class NetSQLiteServer:
-    def __init__(self, db_path: str, port: int):
+    def __init__(self, db_path: str, port: int, auth_token: Optional[str] = None):
         self.db_path = db_path
         self.port = port
+        self.auth_token = auth_token
         self.lock = threading.Lock()
         self.connection = sqlite3.connect(db_path, check_same_thread=False, isolation_level=None)
         self.listener = Listener(('localhost', port))
@@ -102,6 +105,22 @@ class NetSQLiteServer:
 
     def handle_client(self, conn):
         try:
+            # If auth is enabled, first message must be authentication
+            if self.auth_token is not None:
+                auth_msg = conn.recv()
+                if not isinstance(auth_msg, tuple) or len(auth_msg) < 2 or auth_msg[0] != 'auth':
+                    conn.send(Exception("Authentication required"))
+                    conn.close()
+                    return
+
+                # Use hmac.compare_digest for timing-attack safe comparison
+                if not hmac.compare_digest(str(auth_msg[1]), str(self.auth_token)):
+                    conn.send(Exception("Authentication failed"))
+                    conn.close()
+                    return
+
+                conn.send('authenticated')
+
             while True:
                 message = conn.recv()
 
@@ -158,29 +177,40 @@ class NetSQLiteServer:
             self.listener.close()
 
 
-def __server_startup__(port: int, database_name: str):
+def __server_startup__(port: int, database_name: str, auth_token: Optional[str] = None):
     log.info("Hello! The NetSQLite server-component is being launched.")
     log.info(f"Connected to sqlite database: '{database_name}'")
 
-    server = NetSQLiteServer(database_name, port)
+    server = NetSQLiteServer(database_name, port, auth_token)
     log.info(f"Listener instantiated on port {port}")
     log.info("Calling .serve_forever()")
     server.serve_forever()
 
 
-def __spawn_server_process__(db_name: str, port: int) -> subprocess.Popen:
-    proc = subprocess.Popen([sys.executable, __file__, SPAWN_COMMAND, db_name, str(port)])
+def __spawn_server_process__(db_name: str, port: int, auth_token: Optional[str] = None) -> subprocess.Popen:
+    cmd = [sys.executable, __file__, SPAWN_COMMAND, db_name, str(port)]
+    if auth_token is not None:
+        cmd.append(auth_token)
+    proc = subprocess.Popen(cmd)
     log.info(f"An sqlite server was spawned with PID {proc.pid}")
     return proc
 
 
-def __poll(port: int, db_name: str, timeout: float = 10.0):
+def __poll(port: int, db_name: str, auth_token: Optional[str] = None, timeout: float = 10.0):
     wait = 0.1
     total_waited = 0
 
     while total_waited < timeout:
         try:
             conn = Client(('localhost', port))
+
+            # Authenticate if required
+            if auth_token is not None:
+                conn.send(('auth', auth_token))
+                auth_response = conn.recv()
+                if isinstance(auth_response, Exception):
+                    raise auth_response
+
             conn.send(('target_database',))
             response = conn.recv()
 
@@ -199,12 +229,21 @@ def __poll(port: int, db_name: str, timeout: float = 10.0):
     raise RuntimeError(f"Giving up waiting for spawned server after {total_waited}+ seconds.")
 
 
-def connect(db_name: str):
+def connect(db_name: str, auth_token: Optional[str] = None):
     for port_offset in range(10):
         port = STARTPORT + port_offset
 
         try:
             conn = Client(('localhost', port))
+
+            # Authenticate if required
+            if auth_token is not None:
+                conn.send(('auth', auth_token))
+                auth_response = conn.recv()
+                if isinstance(auth_response, Exception):
+                    conn.close()
+                    raise auth_response
+
             conn.send(('target_database',))
             response = conn.recv()
 
@@ -218,14 +257,14 @@ def connect(db_name: str):
             conn.recv()
 
             log.info(f"Connected to existing server on port {port}")
-            return NetSQLiteConnection(conn, db_name, port)
+            return NetSQLiteConnection(conn, db_name, port, auth_token)
 
         except (ConnectionRefusedError, OSError):
             log.info(f"No server on port {port}, spawning one")
-            proc = __spawn_server_process__(db_name=db_name, port=port)
-            conn = __poll(port, db_name)
+            proc = __spawn_server_process__(db_name=db_name, port=port, auth_token=auth_token)
+            conn = __poll(port, db_name, auth_token)
 
-            nsql_conn = NetSQLiteConnection(conn, db_name, port)
+            nsql_conn = NetSQLiteConnection(conn, db_name, port, auth_token)
             nsql_conn.child_process = proc
             return nsql_conn
 
@@ -238,10 +277,11 @@ if __name__ == "__main__":
         format=f"[%(asctime)s] %(levelname)s [{os.getpid()}:%(name)s]: %(message)s"
     )
 
-    if len(sys.argv) == 4 and sys.argv[1] == SPAWN_COMMAND:
-        __server_startup__(port=int(sys.argv[3]), database_name=sys.argv[2])
+    if len(sys.argv) >= 4 and sys.argv[1] == SPAWN_COMMAND:
+        auth_token = sys.argv[4] if len(sys.argv) >= 5 else None
+        __server_startup__(port=int(sys.argv[3]), database_name=sys.argv[2], auth_token=auth_token)
 
     else:
         filnamn = os.path.basename(__file__)
         print(f"SYNTAX ERROR: {filnamn} {' '.join(sys.argv)}")
-        print(f"Usage: {filnamn} {SPAWN_COMMAND} <database_file_path> <port-number>")
+        print(f"Usage: {filnamn} {SPAWN_COMMAND} <database_file_path> <port-number> [auth_token]")
