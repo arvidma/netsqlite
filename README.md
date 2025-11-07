@@ -1,5 +1,5 @@
 # netsqlite
-SQLite almost transparantly over XML-RPC
+SQLite, almost transparently shared across processes
 
 An easy way to share an SQLite databases across multiple processes/threads *on same machine*,
 with less risk of weird locking issues than if going via shared file system.
@@ -8,6 +8,6 @@ with less risk of weird locking issues than if going via shared file system.
 
 * Compatible with Python 3.6 and newer.
 
-* About 1000x overhead compared to normal sqlite3...
+* About 300x overhead compared to normal sqlite3...
 
-* ...But that still allows 10k queries/second before maxing out a single thread!
+* ...But that allows 3000+ queries/second on a single thread!
