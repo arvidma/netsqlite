@@ -2,15 +2,18 @@
 SQLite, almost transparently shared across processes
 
 An easy way to share an SQLite databases across multiple processes/threads *on same machine*,
-with less risk of weird locking issues than if going via shared file system.
+with less risk of weird locking issues than if going via shared file system (especially NFS).
 
 * Single file and only standard-library dependencies.
 
 * Compatible with Python 3.6 and newer.
 
-* About 300x overhead compared to normal sqlite3...
+* Any client is also server. Transparent failover if current server goes away, at least if it
+  goes away when no query is currently running. 
 
-* ...But that allows 3000+ queries/second on a single thread!
+* About 60x-300x overhead compared to normal sqlite3...
+
+* ...But that still allows 10000+ queries/second! (M1 Mac, Python 3.9)
 
 ## Basic Usage
 
@@ -51,5 +54,3 @@ try:
 except Exception as e:
     print(f"Rejected: {e}")  # "Authentication failed"
 ```
-
-**Note**: Authentication is entirely optional. Without an `auth_token`, the system works as before (backward compatible).
