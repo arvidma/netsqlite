@@ -27,6 +27,11 @@ class TestBasicFunctionality(unittest.TestCase):
         self.conn = netsqlite.connect(":memory:")
         self.conn.execute("CREATE TABLE test(id INTEGER PRIMARY KEY, name TEXT, value INTEGER);")
 
+    def tearDown(self):
+        if hasattr(self, 'conn') and self.conn.child_process:
+            self.conn.child_process.kill()
+            self.conn.child_process.wait()
+
     def test_insert(self):
         """Test INSERT with parameters."""
         self.conn.execute("INSERT INTO test VALUES(?, ?, ?)", (1, "Alice", 100))
@@ -79,6 +84,11 @@ class TestAggregation(unittest.TestCase):
         for i in range(1, 11):
             self.conn.execute("INSERT INTO numbers VALUES(?)", (i,))
 
+    def tearDown(self):
+        if hasattr(self, 'conn') and self.conn.child_process:
+            self.conn.child_process.kill()
+            self.conn.child_process.wait()
+
     def test_count(self):
         """Test COUNT aggregation."""
         result = self.conn.execute("SELECT COUNT(*) FROM numbers")
@@ -105,6 +115,11 @@ class TestEdgeCases(unittest.TestCase):
 
     def setUp(self):
         self.conn = netsqlite.connect(":memory:")
+
+    def tearDown(self):
+        if hasattr(self, 'conn') and self.conn.child_process:
+            self.conn.child_process.kill()
+            self.conn.child_process.wait()
 
     def test_empty_table(self):
         """Test querying empty table."""
@@ -147,6 +162,8 @@ class TestPersistence(unittest.TestCase):
         with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
             db_path = f.name
 
+        conn1 = None
+        conn2 = None
         try:
             # Write data
             conn1 = netsqlite.connect(db_path)
@@ -159,6 +176,12 @@ class TestPersistence(unittest.TestCase):
             self.assertEqual(result, [[42]])
 
         finally:
+            if conn1 and conn1.child_process:
+                conn1.child_process.kill()
+                conn1.child_process.wait()
+            if conn2 and conn2.child_process:
+                conn2.child_process.kill()
+                conn2.child_process.wait()
             try:
                 os.unlink(db_path)
             except:
@@ -171,13 +194,20 @@ class TestConnection(unittest.TestCase):
     def test_connection_check(self):
         """Test are_we_gainfully_connected()."""
         conn = netsqlite.connect(":memory:")
-        self.assertTrue(conn.are_we_gainfully_connected())
+        try:
+            self.assertTrue(conn.are_we_gainfully_connected())
+        finally:
+            if conn.child_process:
+                conn.child_process.kill()
+                conn.child_process.wait()
 
     def test_multiple_connections_same_db(self):
         """Test multiple connections to same database."""
         with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
             db_path = f.name
 
+        conn1 = None
+        conn2 = None
         try:
             conn1 = netsqlite.connect(db_path)
             conn1.execute("CREATE TABLE test(x int);")
@@ -189,6 +219,12 @@ class TestConnection(unittest.TestCase):
             self.assertEqual(result, [[1]])
 
         finally:
+            if conn1 and conn1.child_process:
+                conn1.child_process.kill()
+                conn1.child_process.wait()
+            if conn2 and conn2.child_process:
+                conn2.child_process.kill()
+                conn2.child_process.wait()
             try:
                 os.unlink(db_path)
             except:

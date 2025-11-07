@@ -25,6 +25,7 @@ logging.basicConfig(
 
 def worker_insert(db_path, worker_id, count):
     """Worker process that inserts data."""
+    conn = None
     try:
         conn = netsqlite.connect(db_path)
 
@@ -37,9 +38,15 @@ def worker_insert(db_path, worker_id, count):
     except Exception as e:
         return worker_id, 0, f"ERROR: {e}"
 
+    finally:
+        if conn and conn.child_process:
+            conn.child_process.kill()
+            conn.child_process.wait()
+
 
 def worker_reader(db_path, worker_id, duration):
     """Worker process that continuously reads data."""
+    conn = None
     try:
         conn = netsqlite.connect(db_path)
 
@@ -57,6 +64,11 @@ def worker_reader(db_path, worker_id, duration):
     except Exception as e:
         return worker_id, 0, f"ERROR: {e}"
 
+    finally:
+        if conn and conn.child_process:
+            conn.child_process.kill()
+            conn.child_process.wait()
+
 
 class TestMultiProcess(unittest.TestCase):
     """Test multiple processes accessing same database."""
@@ -66,6 +78,7 @@ class TestMultiProcess(unittest.TestCase):
         with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
             db_path = f.name
 
+        conn = None
         try:
             # Create table
             conn = netsqlite.connect(db_path)
@@ -105,6 +118,9 @@ class TestMultiProcess(unittest.TestCase):
                                f"Worker {worker_id} inserted {count} rows, expected {inserts_per_worker}")
 
         finally:
+            if conn and conn.child_process:
+                conn.child_process.kill()
+                conn.child_process.wait()
             try:
                 os.unlink(db_path)
             except:
@@ -116,6 +132,7 @@ class TestMultiProcess(unittest.TestCase):
             db_path = f.name
 
         try:
+            conn = None
             # Create table
             conn = netsqlite.connect(db_path)
             conn.execute("CREATE TABLE test(worker_id INTEGER, value INTEGER);")
@@ -159,6 +176,9 @@ class TestMultiProcess(unittest.TestCase):
             self.assertEqual(total_count, expected_count)
 
         finally:
+            if conn and conn.child_process:
+                conn.child_process.kill()
+                conn.child_process.wait()
             try:
                 os.unlink(db_path)
             except:
@@ -167,6 +187,7 @@ class TestMultiProcess(unittest.TestCase):
 
 def _worker_with_restart(db_path, worker_id):
     """Worker function for restart test (must be top-level for pickling)."""
+    conn = None
     try:
         conn = netsqlite.connect(db_path)
         for i in range(10):
@@ -174,6 +195,10 @@ def _worker_with_restart(db_path, worker_id):
         return worker_id, "SUCCESS"
     except Exception as e:
         return worker_id, f"ERROR: {e}"
+    finally:
+        if conn and conn.child_process:
+            conn.child_process.kill()
+            conn.child_process.wait()
 
 
 class TestServerFailure(unittest.TestCase):
@@ -184,6 +209,7 @@ class TestServerFailure(unittest.TestCase):
         with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
             db_path = f.name
 
+        conn1 = None
         try:
             # Create connection (spawns server)
             conn1 = netsqlite.connect(db_path)
@@ -212,6 +238,9 @@ class TestServerFailure(unittest.TestCase):
             self.assertNotEqual(server_pid, new_server_pid, "Should be a different server")
 
         finally:
+            if conn1 and conn1.child_process:
+                conn1.child_process.kill()
+                conn1.child_process.wait()
             try:
                 os.unlink(db_path)
             except:
@@ -222,6 +251,7 @@ class TestServerFailure(unittest.TestCase):
         with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
             db_path = f.name
 
+        conn = None
         try:
             conn = netsqlite.connect(db_path)
             conn.execute("CREATE TABLE test(iteration INTEGER, value INTEGER);")
@@ -245,6 +275,9 @@ class TestServerFailure(unittest.TestCase):
             self.assertEqual(result[0][0], 3)
 
         finally:
+            if conn and conn.child_process:
+                conn.child_process.kill()
+                conn.child_process.wait()
             try:
                 os.unlink(db_path)
             except:
@@ -255,6 +288,8 @@ class TestServerFailure(unittest.TestCase):
         with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
             db_path = f.name
 
+        conn = None
+        new_conn = None
         try:
             # Create initial table
             conn = netsqlite.connect(db_path)
@@ -286,6 +321,12 @@ class TestServerFailure(unittest.TestCase):
             self.assertEqual(result[0][0], expected_count)
 
         finally:
+            if conn and conn.child_process:
+                conn.child_process.kill()
+                conn.child_process.wait()
+            if new_conn and new_conn.child_process:
+                new_conn.child_process.kill()
+                new_conn.child_process.wait()
             try:
                 os.unlink(db_path)
             except:
