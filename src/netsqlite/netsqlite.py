@@ -169,7 +169,7 @@ def __server_startup__(port: int, database_name: str):
 
 
 def __spawn_server_process__(db_name: str, port: int) -> subprocess.Popen:
-    proc = subprocess.Popen(["python", __file__, SPAWN_COMMAND, db_name, str(port)])
+    proc = subprocess.Popen([sys.executable, __file__, SPAWN_COMMAND, db_name, str(port)])
     log.info(f"An sqlite server was spawned with PID {proc.pid}")
     return proc
 
