@@ -10,6 +10,7 @@ About 300x overhead compared to normal sqlite3, allowing 3000+ queries/second!
 """
 
 import hmac
+import json
 import logging
 import os
 import sqlite3
@@ -30,6 +31,27 @@ ExecuteReturnType = Optional[Sequence[Sequence[Any]]]
 ExecuteParamType = Optional[Sequence[Union[str, int]]]
 
 
+def _serialize(obj):
+    """Serialize object to JSON bytes, avoiding pickle vulnerability."""
+    if isinstance(obj, Exception):
+        # Exceptions need special handling
+        return json.dumps({
+            '_exception': True,
+            'type': type(obj).__name__,
+            'args': obj.args
+        }, default=str).encode('utf-8')
+    return json.dumps(obj, default=str).encode('utf-8')
+
+
+def _deserialize(data):
+    """Deserialize JSON bytes to object."""
+    obj = json.loads(data.decode('utf-8'))
+    if isinstance(obj, dict) and obj.get('_exception'):
+        # Reconstruct exception
+        return Exception(f"{obj['type']}: {obj['args'][0] if obj['args'] else ''}")
+    return obj
+
+
 class NetSQLiteConnection:
     def __init__(self, conn, database_name: str, port: int, auth_token: Optional[str] = None):
         self.database_name = database_name
@@ -42,8 +64,8 @@ class NetSQLiteConnection:
     def _send_receive(self, message):
         with self._lock:
             try:
-                self.conn.send(message)
-                response = self.conn.recv()
+                self.conn.send_bytes(_serialize(message))
+                response = _deserialize(self.conn.recv_bytes())
 
                 if isinstance(response, Exception):
                     raise response
@@ -107,25 +129,25 @@ class NetSQLiteServer:
         try:
             # If auth is enabled, first message must be authentication
             if self.auth_token is not None:
-                auth_msg = conn.recv()
-                if not isinstance(auth_msg, tuple) or len(auth_msg) < 2 or auth_msg[0] != 'auth':
-                    conn.send(Exception("Authentication required"))
+                auth_msg = _deserialize(conn.recv_bytes())
+                if not isinstance(auth_msg, (tuple, list)) or len(auth_msg) < 2 or auth_msg[0] != 'auth':
+                    conn.send_bytes(_serialize(Exception("Authentication required")))
                     conn.close()
                     return
 
                 # Use hmac.compare_digest for timing-attack safe comparison
                 if not hmac.compare_digest(str(auth_msg[1]), str(self.auth_token)):
-                    conn.send(Exception("Authentication failed"))
+                    conn.send_bytes(_serialize(Exception("Authentication failed")))
                     conn.close()
                     return
 
-                conn.send('authenticated')
+                conn.send_bytes(_serialize('authenticated'))
 
             while True:
-                message = conn.recv()
+                message = _deserialize(conn.recv_bytes())
 
-                if not isinstance(message, tuple) or len(message) == 0:
-                    conn.send(Exception("Invalid message format"))
+                if not isinstance(message, (tuple, list)) or len(message) == 0:
+                    conn.send_bytes(_serialize(Exception("Invalid message format")))
                     continue
 
                 method_name = message[0]
@@ -146,11 +168,11 @@ class NetSQLiteServer:
                     else:
                         result = Exception(f"Unknown method: {method_name}")
 
-                    conn.send(result)
+                    conn.send_bytes(_serialize(result))
 
                 except Exception as e:
                     log.error(f"Error handling {method_name}: {e}")
-                    conn.send(e)
+                    conn.send_bytes(_serialize(e))
 
         except (EOFError, ConnectionResetError, BrokenPipeError):
             pass
@@ -206,13 +228,13 @@ def __poll(port: int, db_name: str, auth_token: Optional[str] = None, timeout: f
 
             # Authenticate if required
             if auth_token is not None:
-                conn.send(('auth', auth_token))
-                auth_response = conn.recv()
+                conn.send_bytes(_serialize(('auth', auth_token)))
+                auth_response = _deserialize(conn.recv_bytes())
                 if isinstance(auth_response, Exception):
                     raise auth_response
 
-            conn.send(('target_database',))
-            response = conn.recv()
+            conn.send_bytes(_serialize(('target_database',)))
+            response = _deserialize(conn.recv_bytes())
 
             if response == db_name:
                 return conn
@@ -238,14 +260,14 @@ def connect(db_name: str, auth_token: Optional[str] = None):
 
             # Authenticate if required
             if auth_token is not None:
-                conn.send(('auth', auth_token))
-                auth_response = conn.recv()
+                conn.send_bytes(_serialize(('auth', auth_token)))
+                auth_response = _deserialize(conn.recv_bytes())
                 if isinstance(auth_response, Exception):
                     conn.close()
                     raise auth_response
 
-            conn.send(('target_database',))
-            response = conn.recv()
+            conn.send_bytes(_serialize(('target_database',)))
+            response = _deserialize(conn.recv_bytes())
 
             if response != db_name:
                 conn.close()
@@ -253,8 +275,8 @@ def connect(db_name: str, auth_token: Optional[str] = None):
                             "but serving another database.")
                 continue
 
-            conn.send(('ping',))
-            conn.recv()
+            conn.send_bytes(_serialize(('ping',)))
+            _deserialize(conn.recv_bytes())
 
             log.info(f"Connected to existing server on port {port}")
             return NetSQLiteConnection(conn, db_name, port, auth_token)
